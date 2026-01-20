@@ -81,6 +81,7 @@ DOMAIN_KEYWORDS = {
     ],
 }
 
+
 def infer_topic(text: str) -> Tuple[str, int]:
     t = (text or "").lower()
     best_topic = "未知"
@@ -95,18 +96,27 @@ def infer_topic(text: str) -> Tuple[str, int]:
             best_topic = topic
     return best_topic, best_score
 
+
 def infer_query_topic(query: str) -> str:
     topic, score = infer_topic(query)
     return topic if score > 0 else "未知"
+
 
 def infer_corpus_topic(chunks: List["Chunk"], sample_n: int = 80) -> str:
     if not chunks:
         return "未知"
     n = min(sample_n, len(chunks))
     step = max(1, len(chunks) // n)
-    sample_text = "\n".join(chunks[i].text for i in range(0, len(chunks), step))[:200000]
+
+    # 兜底：即使 chunks 里出现异常对象也不崩
+    sample_text = "\n".join(
+        (getattr(chunks[i], "text", "") or "")
+        for i in range(0, len(chunks), step)
+    )[:200000]
+
     topic, score = infer_topic(sample_text)
     return topic if score > 0 else "未知"
+
 
 # ---------------------------
 # Data structures
@@ -119,6 +129,65 @@ class Chunk:
     page_end: int
     text: str
 
+
+def normalize_chunks(raw) -> List[Chunk]:
+    """
+    把历史版本/异常结构的 chunk 统一转成 Chunk dataclass，
+    避免 .text / .file_name 等访问崩溃。
+    """
+    if not raw:
+        return []
+
+    # 已经是新格式
+    if isinstance(raw, list) and raw and isinstance(raw[0], Chunk):
+        return raw
+
+    out: List[Chunk] = []
+    # 允许 raw 不是 list 的情况
+    items = raw if isinstance(raw, list) else list(raw)
+
+    for idx, it in enumerate(items):
+        # 1) dict 格式（最常见旧格式）
+        if isinstance(it, dict):
+            out.append(Chunk(
+                chunk_id=str(it.get("chunk_id", f"unknown::c{idx:06d}")),
+                file_name=str(it.get("file_name", it.get("source", "unknown.pdf"))),
+                page_start=int(it.get("page_start", it.get("page", 1)) or 1),
+                page_end=int(it.get("page_end", it.get("page_start", it.get("page", 1)) or 1) or 1),
+                text=str(it.get("text", it.get("page_content", it.get("content", ""))) or "")
+            ))
+            continue
+
+        # 2) tuple/list 格式： (chunk_id, file_name, page_start, page_end, text, ...)
+        if isinstance(it, (tuple, list)) and len(it) >= 5:
+            chunk_id, file_name, page_start, page_end, text = it[:5]
+            out.append(Chunk(
+                chunk_id=str(chunk_id),
+                file_name=str(file_name),
+                page_start=int(page_start or 1),
+                page_end=int(page_end or page_start or 1),
+                text=str(text or "")
+            ))
+            continue
+
+        # 3) 兜底：有 text/page_content 属性的对象
+        text = getattr(it, "text", None) or getattr(it, "page_content", None) or getattr(it, "content", None) or ""
+        file_name = getattr(it, "file_name", None) or getattr(it, "source", None) or "unknown.pdf"
+        page_start = getattr(it, "page_start", None) or getattr(it, "page", None) or 1
+        page_end = getattr(it, "page_end", None) or page_start
+        chunk_id = getattr(it, "chunk_id", None) or f"unknown::c{idx:06d}"
+
+        out.append(Chunk(
+            chunk_id=str(chunk_id),
+            file_name=str(file_name),
+            page_start=int(page_start or 1),
+            page_end=int(page_end or page_start or 1),
+            text=str(text or "")
+        ))
+
+    return out
+
+
 # ---------------------------
 # Utility
 # ---------------------------
@@ -126,12 +195,14 @@ def ensure_dirs():
     os.makedirs(PDF_DIR, exist_ok=True)
     os.makedirs(INDEX_DIR, exist_ok=True)
 
+
 def clean_text(s: str) -> str:
     s = s.replace("\u00a0", " ")
     s = re.sub(r"[ \t]+", " ", s)
     s = re.sub(r"\n{3,}", "\n\n", s)
     s = s.replace("-\n", "")
     return s.strip()
+
 
 def extract_pdf_pages(pdf_path: str) -> List[Tuple[int, str]]:
     doc = fitz.open(pdf_path)
@@ -143,6 +214,7 @@ def extract_pdf_pages(pdf_path: str) -> List[Tuple[int, str]]:
             pages.append((i + 1, text))
     doc.close()
     return pages
+
 
 def chunk_pages(file_name: str, pages: List[Tuple[int, str]],
                 chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> List[Chunk]:
@@ -212,8 +284,10 @@ def chunk_pages(file_name: str, pages: List[Tuple[int, str]],
 
     return chunks
 
+
 def load_embedder() -> SentenceTransformer:
     return SentenceTransformer(EMBED_MODEL_NAME)
+
 
 def embed_texts(embedder: SentenceTransformer, texts: List[str], batch_size: int = 32) -> np.ndarray:
     vecs = embedder.encode(
@@ -224,22 +298,37 @@ def embed_texts(embedder: SentenceTransformer, texts: List[str], batch_size: int
     )
     return np.asarray(vecs, dtype="float32")
 
+
 def build_faiss_index(vectors: np.ndarray) -> faiss.Index:
     dim = vectors.shape[1]
     index = faiss.IndexFlatIP(dim)
     index.add(vectors)
     return index
 
+
 def save_index(index: faiss.Index, chunks: List[Chunk]):
     faiss.write_index(index, FAISS_PATH)
     with open(META_PATH, "wb") as f:
         pickle.dump(chunks, f)
 
+
 def load_index() -> Tuple[faiss.Index, List[Chunk]]:
     index = faiss.read_index(FAISS_PATH)
     with open(META_PATH, "rb") as f:
-        chunks = pickle.load(f)
+        raw = pickle.load(f)
+
+    chunks = normalize_chunks(raw)
+
+    # 可选：把归一化后的结果写回，避免下次还走兼容分支
+    try:
+        if isinstance(raw, list) and raw and not isinstance(raw[0], Chunk):
+            with open(META_PATH, "wb") as wf:
+                pickle.dump(chunks, wf)
+    except Exception:
+        pass
+
     return index, chunks
+
 
 # ---------------------------
 # LLM
@@ -267,6 +356,7 @@ def llm_chat(messages: List[Dict[str, str]], temperature: float = 0.2) -> str:
     data = r.json()
     return data["choices"][0]["message"]["content"]
 
+
 # ---------------------------
 # Multi-turn retrieval helpers
 # ---------------------------
@@ -275,11 +365,13 @@ FOLLOWUP_MARKERS = [
     "为什么", "怎么", "那然后", "然后呢", "还有呢", "如何", "能不能"
 ]
 
+
 def is_followup_question(q: str) -> bool:
     q = (q or "").strip()
     if len(q) <= 10:
         return True
     return any(m in q for m in FOLLOWUP_MARKERS)
+
 
 def build_retrieval_query(current_q: str, user_history: List[str], max_turns: int = 4) -> str:
     current_q = (current_q or "").strip()
@@ -289,6 +381,7 @@ def build_retrieval_query(current_q: str, user_history: List[str], max_turns: in
         return current_q
     tail = [h.strip() for h in user_history[-max_turns:] if h.strip()]
     return "；".join(tail + [current_q])
+
 
 # ---------------------------
 # Retrieval + Guards
@@ -304,19 +397,22 @@ def retrieve(index: faiss.Index, chunks: List[Chunk], embedder: SentenceTransfor
         results.append((float(s), chunks[int(i)]))
     return results
 
+
 def format_evidence(results: List[Tuple[float, Chunk]]) -> str:
     lines = []
     for idx, (score, c) in enumerate(results, start=1):
         src = f"{c.file_name} p{c.page_start}" if c.page_start == c.page_end else f"{c.file_name} p{c.page_start}-{c.page_end}"
-        snippet = c.text[:450].replace("\n", " ")
+        snippet = (c.text or "")[:450].replace("\n", " ")
         lines.append(f"[{idx}] 来源：{src}\n片段：{snippet}")
     return "\n\n".join(lines)
+
 
 _CH_CONNECTORS = ["和", "与", "及", "以及", "还有", "以及其", "跟", "同", "对比", "比较"]
 _STOP_PHRASES = [
     "是什么", "是啥", "是什么呢", "什么", "怎么", "如何", "为什么",
     "能不能", "可以吗", "吗", "呢", "呀", "啊"
 ]
+
 
 def extract_keywords(q: str) -> List[str]:
     q = (q or "").strip().lower()
@@ -351,6 +447,7 @@ def extract_keywords(q: str) -> List[str]:
 
     return kws
 
+
 def _sub_keywords(w: str) -> List[str]:
     w = (w or "").strip()
     if len(w) <= 4:
@@ -363,12 +460,13 @@ def _sub_keywords(w: str) -> List[str]:
                 subs.append(s)
     return subs
 
+
 def evidence_has_keywords(results: List[Tuple[float, Chunk]], query: str, min_hits: int = 1) -> bool:
     kws = extract_keywords(query)
     if not kws:
         return True
 
-    evidence_text = "\n".join(c.text.lower() for _, c in results)
+    evidence_text = "\n".join((c.text or "").lower() for _, c in results)
 
     hits = 0
     for k in kws:
@@ -382,6 +480,7 @@ def evidence_has_keywords(results: List[Tuple[float, Chunk]], query: str, min_hi
 
     return hits >= min_hits
 
+
 def make_hint_block(query: str, corpus_topic: str) -> str:
     q_topic = infer_query_topic(query)
     if q_topic != "未知" and corpus_topic != "未知" and q_topic != corpus_topic:
@@ -391,6 +490,7 @@ def make_hint_block(query: str, corpus_topic: str) -> str:
             f"- 建议导入与「{q_topic}」相关的教材/讲义/课件 PDF，或换成更贴合当前资料的问法。"
         )
     return ""
+
 
 def answer_with_rag(query: str, history: List[Dict[str, str]],
                     results: List[Tuple[float, Chunk]], corpus_topic: str,
@@ -429,6 +529,7 @@ def answer_with_rag(query: str, history: List[Dict[str, str]],
     messages.append({"role": "user", "content": user_prompt})
     return llm_chat(messages)
 
+
 def fallback_answer_on_error(err: Exception, results: List[Tuple[float, Chunk]]) -> str:
     lines = [
         "【回答】",
@@ -447,10 +548,11 @@ def fallback_answer_on_error(err: Exception, results: List[Tuple[float, Chunk]])
 
     lines.append("")
     for i, (score, c) in enumerate(results, start=1):
-        snippet = c.text.strip().replace("\n", " ")
+        snippet = (c.text or "").strip().replace("\n", " ")
         snippet = snippet[:260] + ("…" if len(snippet) > 260 else "")
         lines.append(f"证据[{i}] 摘要：{snippet}")
     return "\n".join(lines)
+
 
 # ---------------------------
 # Conversation store（多会话 + 自动命名 + 持久化）
@@ -458,12 +560,14 @@ def fallback_answer_on_error(err: Exception, results: List[Tuple[float, Chunk]])
 def _new_conv_id() -> str:
     return f"c{int(time.time()*1000)}"
 
+
 def _normalize_title(s: str) -> str:
     s = (s or "").strip()
     s = re.sub(r"\s+", " ", s)
     s = s.replace("\n", " ").replace("\r", " ")
     s = s.strip(" -—_，,。.!！?？")
     return s
+
 
 def _make_unique_title(base: str, existing_titles: List[str]) -> str:
     base = _normalize_title(base)
@@ -477,6 +581,7 @@ def _make_unique_title(base: str, existing_titles: List[str]) -> str:
         if cand not in existing_titles:
             return cand
         k += 1
+
 
 def auto_name_conversation_if_needed(conv_id: str, first_user_query: str):
     store = st.session_state.conv_store
@@ -495,6 +600,7 @@ def auto_name_conversation_if_needed(conv_id: str, first_user_query: str):
     conv["title"] = _make_unique_title(base, existing)
     conv["updated_at"] = int(time.time())
 
+
 def load_conversations_from_disk() -> Dict:
     if not os.path.exists(CONV_PATH):
         return {"active_id": "", "conversations": {}}
@@ -507,12 +613,14 @@ def load_conversations_from_disk() -> Dict:
     except Exception:
         return {"active_id": "", "conversations": {}}
 
+
 def save_conversations_to_disk(store: Dict):
     try:
         with open(CONV_PATH, "w", encoding="utf-8") as f:
             json.dump(store, f, ensure_ascii=False, indent=2)
     except Exception:
         pass
+
 
 def init_conversation_state():
     if "conv_store" in st.session_state and "active_conv_id" in st.session_state:
@@ -539,18 +647,22 @@ def init_conversation_state():
     st.session_state.conv_store = store
     st.session_state.active_conv_id = store["active_id"]
 
+
 def get_active_history() -> List[Dict[str, str]]:
     cid = st.session_state.active_conv_id
     return st.session_state.conv_store["conversations"][cid]["history"]
+
 
 def set_active_history(new_history: List[Dict[str, str]]):
     cid = st.session_state.active_conv_id
     st.session_state.conv_store["conversations"][cid]["history"] = new_history
     st.session_state.conv_store["conversations"][cid]["updated_at"] = int(time.time())
 
+
 def conv_ids_sorted() -> List[str]:
     convs = st.session_state.conv_store["conversations"]
     return sorted(convs.keys(), key=lambda cid: convs[cid].get("updated_at", 0), reverse=True)
+
 
 def create_new_conversation():
     store = st.session_state.conv_store
@@ -565,6 +677,7 @@ def create_new_conversation():
     st.session_state.active_conv_id = cid
     save_conversations_to_disk(store)
 
+
 def set_active_conversation(cid: str):
     store = st.session_state.conv_store
     if cid not in store["conversations"]:
@@ -572,6 +685,7 @@ def set_active_conversation(cid: str):
     st.session_state.active_conv_id = cid
     store["active_id"] = cid
     save_conversations_to_disk(store)
+
 
 def rename_conversation(cid: str, new_title: str):
     store = st.session_state.conv_store
@@ -582,6 +696,7 @@ def rename_conversation(cid: str, new_title: str):
     store["conversations"][cid]["title"] = _make_unique_title(new_title, existing)
     store["conversations"][cid]["updated_at"] = int(time.time())
     save_conversations_to_disk(store)
+
 
 def delete_conversation(cid: str):
     store = st.session_state.conv_store
@@ -603,6 +718,7 @@ def delete_conversation(cid: str):
     st.session_state.active_conv_id = new_active
     save_conversations_to_disk(store)
 
+
 # ---------------------------
 # Sidebar UI helpers（展开列表 + 单独新聊天按钮）
 # ---------------------------
@@ -611,6 +727,7 @@ def _fmt_time(ts: int) -> str:
         return "--"
     return time.strftime("%m-%d %H:%M", time.localtime(ts))
 
+
 def _group_by_day(conv_ids: List[str], convs: Dict[str, Dict]) -> Dict[str, List[str]]:
     groups = defaultdict(list)
     for cid in conv_ids:
@@ -618,6 +735,7 @@ def _group_by_day(conv_ids: List[str], convs: Dict[str, Dict]) -> Dict[str, List
         day = time.strftime("%Y-%m-%d", time.localtime(ts)) if ts else "未知日期"
         groups[day].append(cid)
     return dict(sorted(groups.items(), key=lambda x: x[0], reverse=True))
+
 
 def _sidebar_chat_list():
     init_conversation_state()
@@ -632,7 +750,7 @@ def _sidebar_chat_list():
         st.rerun()
 
     q = st.text_input("搜索对话", value="", placeholder="输入关键词过滤…")
-    q_low = (q or "").strip().nlower() if hasattr(str, "nlower") else (q or "").strip().lower()
+    q_low = (q or "").strip().lower()
 
     ids = conv_ids_sorted()
     if q_low:
@@ -670,6 +788,7 @@ def _sidebar_chat_list():
             delete_conversation(active)
             st.rerun()
 
+
 # ---------------------------
 # Streamlit App
 # ---------------------------
@@ -705,7 +824,7 @@ def main():
         pdf_files = [f for f in os.listdir(PDF_DIR) if f.lower().endswith(".pdf")]
         if not pdf_files:
             st.error("未找到PDF。请将PDF放入 data/pdf/ 后重试。")
-            return
+            return False
 
         all_chunks: List[Chunk] = []
         for pf in tqdm(pdf_files, desc="PDF解析"):
@@ -716,7 +835,7 @@ def main():
 
         if not all_chunks:
             st.error("PDF未抽取到有效文本（可能是扫描版）。请更换文本型PDF或后续加OCR。")
-            return
+            return False
 
         texts = [c.text for c in all_chunks]
         with st.spinner("向量化中..."):
@@ -727,18 +846,38 @@ def main():
             save_index(index, all_chunks)
 
         st.success(f"索引构建完成：chunks={len(all_chunks)}，PDF={len(pdf_files)}")
+        return True
 
     if rebuild or (not index_exists):
         if not index_exists:
             st.info("未检测到索引，将自动构建一次。")
-        do_build()
+        ok = do_build()
+        if not ok:
+            st.stop()
 
     if not (os.path.exists(FAISS_PATH) and os.path.exists(META_PATH)):
         st.stop()
 
+    # ---- 加载索引（带旧格式兼容/自动修复）----
     if "index" not in st.session_state or "chunks" not in st.session_state:
         with st.spinner("加载索引..."):
+            try:
+                st.session_state.index, st.session_state.chunks = load_index()
+            except Exception as e:
+                st.warning(f"索引加载失败，尝试自动重建：{e}")
+                ok = do_build()
+                if not ok:
+                    st.stop()
+                st.session_state.index, st.session_state.chunks = load_index()
+
+        # 极端兜底：如果仍不是 Chunk，就重建
+        if st.session_state.chunks and not isinstance(st.session_state.chunks[0], Chunk):
+            st.warning("检测到旧版本索引元数据格式不兼容，正在自动重建索引…")
+            ok = do_build()
+            if not ok:
+                st.stop()
             st.session_state.index, st.session_state.chunks = load_index()
+            st.rerun()
 
     if "corpus_topic" not in st.session_state:
         st.session_state.corpus_topic = infer_corpus_topic(st.session_state.chunks)
@@ -808,6 +947,7 @@ def main():
                 st.write(c.text)
 
         st.caption(f"检索耗时：{(t_retr - t0):.2f}s｜生成耗时：{(t_llm - t_retr):.2f}s")
+
 
 if __name__ == "__main__":
     main()
