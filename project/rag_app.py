@@ -129,6 +129,67 @@ class Chunk:
     page_end: int
     text: str
 
+def _cget(c, key: str, default=None):
+    """从 Chunk / dict / tuple(list) / 任意对象安全取字段。"""
+    if c is None:
+        return default
+    if isinstance(c, dict):
+        return c.get(key, default)
+
+    # tuple/list 旧格式兼容： (chunk_id, file_name, page_start, page_end, text, ...)
+    if isinstance(c, (tuple, list)):
+        mapping = {"chunk_id": 0, "file_name": 1, "page_start": 2, "page_end": 3, "text": 4}
+        idx = mapping.get(key, None)
+        if idx is not None and len(c) > idx:
+            return c[idx]
+        return default
+
+    # 对象属性
+    return getattr(c, key, default)
+
+
+def c_chunk_id(c, fallback=""):
+    return str(_cget(c, "chunk_id", fallback) or fallback)
+
+
+def c_file_name(c, fallback="unknown.pdf"):
+    return str(_cget(c, "file_name", _cget(c, "source", fallback)) or fallback)
+
+
+def c_page_start(c, fallback=1):
+    v = _cget(c, "page_start", _cget(c, "page", fallback))
+    try:
+        return int(v or fallback)
+    except Exception:
+        return int(fallback)
+
+
+def c_page_end(c, fallback=None):
+    if fallback is None:
+        fallback = c_page_start(c, 1)
+    v = _cget(c, "page_end", fallback)
+    try:
+        return int(v or fallback)
+    except Exception:
+        return int(fallback)
+
+
+def c_text(c, fallback=""):
+    v = _cget(c, "text", _cget(c, "page_content", _cget(c, "content", fallback)))
+    return str(v or fallback)
+
+
+def as_chunk(c, idx: int = 0) -> "Chunk":
+    """把任意 chunk 结构转成 Chunk dataclass（用于统一后续逻辑）。"""
+    if isinstance(c, Chunk):
+        return c
+    return Chunk(
+        chunk_id=c_chunk_id(c, f"unknown::c{idx:06d}"),
+        file_name=c_file_name(c, "unknown.pdf"),
+        page_start=c_page_start(c, 1),
+        page_end=c_page_end(c, None),
+        text=c_text(c, "")
+    )
 
 def normalize_chunks(raw) -> List[Chunk]:
     """
@@ -951,3 +1012,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
