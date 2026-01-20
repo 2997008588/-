@@ -193,59 +193,45 @@ def as_chunk(c, idx: int = 0) -> "Chunk":
 
 def normalize_chunks(raw) -> List[Chunk]:
     """
-    把历史版本/异常结构的 chunk 统一转成 Chunk dataclass，
-    避免 .text / .file_name 等访问崩溃。
+    兼容旧版 meta.pkl：
+    - list[Chunk]
+    - list[dict] / list[tuple]
+    - dict（key->chunk / idx->chunk / chunk_id->chunk）
     """
     if not raw:
         return []
 
-    # 已经是新格式
+    # 已经是 list[Chunk]
     if isinstance(raw, list) and raw and isinstance(raw[0], Chunk):
         return raw
 
-    out: List[Chunk] = []
-    # 允许 raw 不是 list 的情况
-    items = raw if isinstance(raw, list) else list(raw)
+    # dict 情况：非常关键（你之前这里容易把 dict 变成 key 列表）
+    if isinstance(raw, dict):
+        keys = list(raw.keys())
 
-    for idx, it in enumerate(items):
-        # 1) dict 格式（最常见旧格式）
-        if isinstance(it, dict):
-            out.append(Chunk(
-                chunk_id=str(it.get("chunk_id", f"unknown::c{idx:06d}")),
-                file_name=str(it.get("file_name", it.get("source", "unknown.pdf"))),
-                page_start=int(it.get("page_start", it.get("page", 1)) or 1),
-                page_end=int(it.get("page_end", it.get("page_start", it.get("page", 1)) or 1) or 1),
-                text=str(it.get("text", it.get("page_content", it.get("content", ""))) or "")
-            ))
-            continue
+        # 如果 key 像数字（或数字字符串），按数字排序更靠谱
+        def _is_intlike(x):
+            try:
+                int(x)
+                return True
+            except Exception:
+                return False
 
-        # 2) tuple/list 格式： (chunk_id, file_name, page_start, page_end, text, ...)
-        if isinstance(it, (tuple, list)) and len(it) >= 5:
-            chunk_id, file_name, page_start, page_end, text = it[:5]
-            out.append(Chunk(
-                chunk_id=str(chunk_id),
-                file_name=str(file_name),
-                page_start=int(page_start or 1),
-                page_end=int(page_end or page_start or 1),
-                text=str(text or "")
-            ))
-            continue
+        if keys and all(_is_intlike(k) for k in keys):
+            items = [raw[k] for k in sorted(keys, key=lambda x: int(x))]
+        else:
+            # 否则按插入顺序的 values（一般与构建时一致；若不一致建议重建索引）
+            items = list(raw.values())
+    elif isinstance(raw, list):
+        items = raw
+    else:
+        # 其他可迭代
+        try:
+            items = list(raw)
+        except Exception:
+            items = [raw]
 
-        # 3) 兜底：有 text/page_content 属性的对象
-        text = getattr(it, "text", None) or getattr(it, "page_content", None) or getattr(it, "content", None) or ""
-        file_name = getattr(it, "file_name", None) or getattr(it, "source", None) or "unknown.pdf"
-        page_start = getattr(it, "page_start", None) or getattr(it, "page", None) or 1
-        page_end = getattr(it, "page_end", None) or page_start
-        chunk_id = getattr(it, "chunk_id", None) or f"unknown::c{idx:06d}"
-
-        out.append(Chunk(
-            chunk_id=str(chunk_id),
-            file_name=str(file_name),
-            page_start=int(page_start or 1),
-            page_end=int(page_end or page_start or 1),
-            text=str(text or "")
-        ))
-
+    out: List[Chunk] = [as_chunk(it, idx=i) for i, it in enumerate(items)]
     return out
 
 
@@ -462,10 +448,14 @@ def retrieve(index: faiss.Index, chunks: List[Chunk], embedder: SentenceTransfor
 def format_evidence(results: List[Tuple[float, Chunk]]) -> str:
     lines = []
     for idx, (score, c) in enumerate(results, start=1):
-        src = f"{c.file_name} p{c.page_start}" if c.page_start == c.page_end else f"{c.file_name} p{c.page_start}-{c.page_end}"
-        snippet = (c.text or "")[:450].replace("\n", " ")
+        fn = c_file_name(c)
+        ps = c_page_start(c)
+        pe = c_page_end(c)
+        src = f"{fn} p{ps}" if ps == pe else f"{fn} p{ps}-{pe}"
+        snippet = c_text(c)[:450].replace("\n", " ")
         lines.append(f"[{idx}] 来源：{src}\n片段：{snippet}")
     return "\n\n".join(lines)
+
 
 
 _CH_CONNECTORS = ["和", "与", "及", "以及", "还有", "以及其", "跟", "同", "对比", "比较"]
@@ -527,7 +517,8 @@ def evidence_has_keywords(results: List[Tuple[float, Chunk]], query: str, min_hi
     if not kws:
         return True
 
-    evidence_text = "\n".join((c.text or "").lower() for _, c in results)
+    evidence_text = "\n".join(c_text(c).lower() for _, c in results)
+
 
     hits = 0
     for k in kws:
@@ -604,12 +595,15 @@ def fallback_answer_on_error(err: Exception, results: List[Tuple[float, Chunk]])
         return "\n".join(lines)
 
     for i, (score, c) in enumerate(results, start=1):
-        src = f"{c.file_name} p{c.page_start}" if c.page_start == c.page_end else f"{c.file_name} p{c.page_start}-{c.page_end}"
+        fn = c_file_name(c)
+        ps = c_page_start(c)
+        pe = c_page_end(c)
+        src = f"{fn} p{ps}" if ps == pe else f"{fn} p{ps}-{pe}"
         lines.append(f"- [{i}] {src}")
 
     lines.append("")
     for i, (score, c) in enumerate(results, start=1):
-        snippet = (c.text or "").strip().replace("\n", " ")
+        snippet = c_text(c).strip().replace("\n", " ")
         snippet = snippet[:260] + ("…" if len(snippet) > 260 else "")
         lines.append(f"证据[{i}] 摘要：{snippet}")
     return "\n".join(lines)
@@ -998,18 +992,25 @@ def main():
         save_conversations_to_disk(st.session_state.conv_store)
 
         with st.expander("本次检索到的证据（Top-K）", expanded=True):
-            cnt = Counter(c.file_name for _, c in results)
+            cnt = Counter(c_file_name(c) for _, c in results)
+
             if cnt:
                 dist = "；".join([f"{k}×{v}" for k, v in cnt.items()])
                 st.write("命中文件分布：", dist)
             for i, (score, c) in enumerate(results, start=1):
-                src = f"{c.file_name} p{c.page_start}" if c.page_start == c.page_end else f"{c.file_name} p{c.page_start}-{c.page_end}"
-                st.markdown(f"**[{i}] 相似度：{score:.3f}｜{src}｜{c.chunk_id}**")
-                st.write(c.text)
+                fn = c_file_name(c)
+                ps = c_page_start(c)
+                pe = c_page_end(c)
+                cid = c_chunk_id(c, f"unknown::c{i:06d}")
+                src = f"{fn} p{ps}" if ps == pe else f"{fn} p{ps}-{pe}"
+                st.markdown(f"**[{i}] 相似度：{score:.3f}｜{src}｜{cid}**")
+                st.write(c_text(c))
+
 
         st.caption(f"检索耗时：{(t_retr - t0):.2f}s｜生成耗时：{(t_llm - t_retr):.2f}s")
 
 
 if __name__ == "__main__":
     main()
+
 
